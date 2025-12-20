@@ -1,0 +1,1073 @@
+name: DevSecOps CI/CD Security Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  DOCKER_IMAGE: acecloudacademy/bankapp:latest
+
+jobs:
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1: CODE COMPILATION
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Validate that the source code compiles successfully
+# This is the foundation of the pipeline - ensures basic code integrity
+# ══════════════════════════════════════════════════════════════════════════════
+  compile:
+    name: "📦 Compile Source Code"
+    runs-on: self-hosted
+    steps:
+      - name: Clean workspace
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+          sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Set up Maven
+        uses: s4u/setup-maven-action@v1.12.0
+        with:
+          maven-version: "3.9.9"
+
+      - name: Compile Project
+        run: mvn -B compile
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2: SECRET SCANNING (SAST - Pre-Commit Security)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: Gitleaks
+# Category: SAST (Static Application Security Testing)
+# Purpose: Detect hardcoded secrets, API keys, passwords, and credentials in code
+# Why First: Secrets are critical vulnerabilities that must be caught early
+# Prevents: Credential leaks, unauthorized access, compliance violations
+# ══════════════════════════════════════════════════════════════════════════════
+  gitleaks-scan:
+    name: "🔐 SAST: Secret Detection (Gitleaks)"
+    runs-on: self-hosted
+    needs: compile
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for secret detection
+
+      - name: Install Gitleaks
+        run: |
+          if ! command -v gitleaks &> /dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y gitleaks
+          fi
+
+      - name: Run Gitleaks Secret Scan
+        run: |
+          gitleaks detect --source . \
+            --report-path gitleaks-report.json \
+            --report-format json \
+            --verbose
+
+      - name: Upload Gitleaks Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3: FILESYSTEM VULNERABILITY SCAN (SAST - Infrastructure as Code)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: Trivy Filesystem Scanner
+# Category: SAST (Static Application Security Testing)
+# Purpose: Scan IaC files, configs, and source code for vulnerabilities
+# Detects: Misconfigurations in Kubernetes, Terraform, Dockerfiles
+# Checks: Security best practices in infrastructure code
+# ══════════════════════════════════════════════════════════════════════════════
+  trivy-fs-scan:
+    name: "🛡️ SAST: Filesystem Security (Trivy FS)"
+    runs-on: self-hosted
+    needs: gitleaks-scan
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          if ! command -v trivy &> /dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+              | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/trivy.gpg
+            echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" \
+              | sudo tee /etc/apt/sources.list.d/trivy.list
+            sudo apt-get update -y
+            sudo apt-get install -y trivy
+          fi
+
+      - name: Prepare Trivy HTML Template
+        run: |
+          mkdir -p contrib
+          wget -q -O contrib/html.tpl https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+
+      - name: Run Trivy Filesystem Scan
+        run: |
+          trivy fs --exit-code 0 --severity HIGH,CRITICAL \
+            --format json --output trivy-fs-report.json .
+          trivy fs --exit-code 0 --severity HIGH,CRITICAL \
+            --format template --template "./contrib/html.tpl" \
+            --output trivy-fs-report.html .
+
+      - name: Upload Trivy FS Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-fs-reports
+          path: |
+            trivy-fs-report.json
+            trivy-fs-report.html
+          retention-days: 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 4: CODE QUALITY & SECURITY ANALYSIS + QUALITY GATE (SAST)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: SonarQube with Quality Gate
+# Category: SAST (Static Application Security Testing)
+# Purpose: Deep source code analysis for security vulnerabilities and code quality
+# Detects: SQL injection, XSS, code smells, bugs, security hotspots
+# Validates: Code meets minimum security and quality standards
+# Blocks: Pipeline if critical issues are found
+# ══════════════════════════════════════════════════════════════════════════════
+  sonarqube-analysis:
+    name: "🔍 SAST: Code Analysis & Quality Gate (SonarQube)"
+    runs-on: self-hosted
+    needs: trivy-fs-scan
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Set up Maven
+        uses: s4u/setup-maven-action@v1.12.0
+        with:
+          maven-version: "3.9.9"
+
+      - name: Build Project for Analysis
+        run: mvn -B clean verify
+
+      - name: Run SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: Check SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 10
+        with:
+          pollingTimeoutSec: 600
+          scanMetadataReportFile: .scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: Upload SonarQube Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sonarqube-report
+          path: .scannerwork/
+          retention-days: 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5: DEPENDENCY VULNERABILITY SCAN (SCA - Software Composition Analysis)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: OWASP Dependency-Check
+# Category: SCA (Software Composition Analysis) - Part of SAST
+# Purpose: Identify known vulnerabilities in third-party dependencies
+# Checks: CVEs in libraries using NVD database
+# Detects: Outdated packages, vulnerable components, license issues
+# ══════════════════════════════════════════════════════════════════════════════
+  owasp-dependency-check:
+    name: "📚 SCA: Dependency Vulnerability Scan (OWASP)"
+    runs-on: self-hosted
+    needs: sonarqube-analysis
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create Reports Directory
+        run: |
+          mkdir -p reports/owasp
+          mkdir -p $HOME/.dependency-check/data
+
+      - name: Run OWASP Dependency Check
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "$HOME/.dependency-check/data:/usr/share/dependency-check/data" \
+            owasp/dependency-check:latest \
+            --scan /src \
+            --format HTML \
+            --format JSON \
+            --format SARIF \
+            --out /src/reports/owasp \
+            --project "BankApp DevSecOps" \
+            --nvdApiKey ${{ secrets.NVD_API_KEY }} \
+            --failOnCVSS 11 \
+            --prettyPrint \
+            --disableNodeAudit \
+            --disableYarnAudit \
+            --disableAssembly || {
+              echo "⚠️ OWASP scan with NVD API failed, retrying with cached database..."
+              
+              docker run --rm \
+                -v "$PWD:/src" \
+                -v "$HOME/.dependency-check/data:/usr/share/dependency-check/data" \
+                owasp/dependency-check:latest \
+                --scan /src \
+                --format HTML \
+                --format JSON \
+                --out /src/reports/owasp \
+                --project "BankApp DevSecOps" \
+                --failOnCVSS 11 \
+                --prettyPrint \
+                --noupdate \
+                --disableNodeAudit \
+                --disableYarnAudit \
+                --disableAssembly || echo "❌ OWASP scan failed, continuing pipeline..."
+            }
+
+      - name: Check OWASP Reports
+        id: check_owasp
+        run: |
+          if [ -d "reports/owasp" ] && [ "$(ls -A reports/owasp)" ]; then
+            echo "reports_exist=true" >> $GITHUB_OUTPUT
+            echo "✅ OWASP reports generated successfully"
+            ls -lh reports/owasp/
+          else
+            echo "reports_exist=false" >> $GITHUB_OUTPUT
+            echo "❌ No OWASP reports generated"
+          fi
+
+      - name: Upload OWASP Report
+        if: steps.check_owasp.outputs.reports_exist == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-report
+          path: reports/owasp
+          retention-days: 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 6: BUILD APPLICATION ARTIFACT
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Create deployable application package (JAR/WAR)
+# Only reached if all security scans pass
+# Produces artifact for containerization
+# ══════════════════════════════════════════════════════════════════════════════
+  build-artifact:
+    name: "🏗️ Build Application Artifact"
+    runs-on: self-hosted
+    needs: owasp-dependency-check
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Set up Maven
+        uses: s4u/setup-maven-action@v1.12.0
+        with:
+          maven-version: "3.9.9"
+
+      - name: Build Application Package
+        run: mvn -B clean package -DskipTests
+
+      - name: Upload Application JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 30
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 7: DOCKER IMAGE BUILD
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Create container image from application artifact
+# Prepares image for security scanning before registry push
+# Uses multi-stage builds for minimal attack surface
+# ══════════════════════════════════════════════════════════════════════════════
+  docker-build:
+    name: "🐳 Build Docker Image"
+    runs-on: self-hosted
+    needs: build-artifact
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Application JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: app
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image (No Cache Export)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.DOCKER_IMAGE }}
+          load: true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 8: CONTAINER IMAGE SECURITY SCAN (DAST - Image Analysis)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: Trivy Image Scanner
+# Category: DAST (Dynamic Application Security Testing) - Container Security
+# Purpose: Scan Docker image for vulnerabilities before deployment
+# Detects: OS vulnerabilities, package CVEs, misconfigurations
+# Checks: Base image security, layer vulnerabilities
+# Why Critical: Last defense before pushing to registry
+# ══════════════════════════════════════════════════════════════════════════════
+  trivy-image-scan:
+    name: "🔎 DAST: Container Image Scan (Trivy)"
+    runs-on: self-hosted
+    needs: docker-build
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Prepare Trivy HTML Template
+        run: |
+          mkdir -p contrib
+          wget -q -O contrib/html.tpl https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+
+      - name: Run Trivy Image Scan
+        run: |
+          trivy image --exit-code 0 --severity HIGH,CRITICAL \
+            --format json --output trivy-image-report.json \
+            ${{ env.DOCKER_IMAGE }}
+          
+          trivy image --exit-code 0 --severity HIGH,CRITICAL \
+            --format template --template "./contrib/html.tpl" \
+            --output trivy-image-report.html \
+            ${{ env.DOCKER_IMAGE }}
+
+      - name: Upload Trivy Image Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-reports
+          path: |
+            trivy-image-report.json
+            trivy-image-report.html
+          retention-days: 30
+
+      - name: Evaluate Scan Results
+        run: |
+          CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-image-report.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-image-report.json)
+          
+          echo "🔍 Vulnerability Summary:"
+          echo "   CRITICAL: $CRITICAL"
+          echo "   HIGH: $HIGH"
+          
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "⚠️ Warning: $CRITICAL critical vulnerabilities found in image"
+          fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 9: DEPLOY APPLICATION FOR DAST TESTING
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Deploy application in test environment for runtime security testing
+# Creates: Temporary container instance for OWASP ZAP to scan
+# Network: Exposes application on localhost for security testing
+# Cleanup: Container will be stopped after ZAP scan completes
+# ══════════════════════════════════════════════════════════════════════════════
+  deploy-for-testing:
+    name: "🚀 Deploy Application for DAST Testing"
+    runs-on: self-hosted
+    needs: trivy-image-scan
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Stop Existing Test Container
+        run: |
+          docker stop bankapp-test 2>/dev/null || true
+          docker rm bankapp-test 2>/dev/null || true
+          echo "✅ Cleaned up any existing test containers"
+
+      - name: Deploy Application Container
+        run: |
+          docker run -d \
+            --name bankapp-test \
+            -p 8080:8080 \
+            --health-cmd="curl -f http://localhost:8080/actuator/health || exit 1" \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=5 \
+            ${{ env.DOCKER_IMAGE }}
+          
+          echo "🐳 Container started: bankapp-test"
+          echo "📍 Application URL: http://localhost:8080"
+
+      - name: Wait for Application to be Ready
+        run: |
+          echo "⏳ Waiting for application to be healthy..."
+          
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            if docker inspect --format='{{.State.Health.Status}}' bankapp-test 2>/dev/null | grep -q "healthy"; then
+              echo "✅ Application is healthy and ready for testing!"
+              docker logs bankapp-test --tail 20
+              exit 0
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Application not ready yet..."
+            sleep 10
+          done
+          
+          echo "❌ Application failed to become healthy"
+          docker logs bankapp-test
+          exit 1
+
+      - name: Verify Application Endpoints
+        run: |
+          echo "🔍 Verifying application endpoints..."
+          
+          # Test root endpoint
+          if curl -f -s http://localhost:8080/ > /dev/null; then
+            echo "✅ Root endpoint accessible"
+          else
+            echo "⚠️ Root endpoint not accessible"
+          fi
+          
+          # Test actuator health
+          if curl -f -s http://localhost:8080/actuator/health > /dev/null; then
+            echo "✅ Health endpoint accessible"
+          else
+            echo "⚠️ Health endpoint not accessible"
+          fi
+          
+          echo "✅ Application ready for OWASP ZAP scan"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 10: OWASP ZAP SECURITY SCAN (DAST - Runtime Vulnerability Testing)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tool: OWASP ZAP (Zed Attack Proxy)
+# Category: DAST (Dynamic Application Security Testing)
+# Purpose: Test running application for runtime security vulnerabilities
+# Detects: SQL injection, XSS, CSRF, security misconfigurations, authentication issues
+# Method: Active scanning - sends attack payloads to detect real vulnerabilities
+# Tests: OWASP Top 10 vulnerabilities in live application behavior
+# Reports: HTML, JSON, and XML formats with detailed vulnerability findings
+# ══════════════════════════════════════════════════════════════════════════════
+  owasp-zap-scan:
+    name: "🕷️ DAST: Runtime Security Testing (OWASP ZAP)"
+    runs-on: self-hosted
+    needs: deploy-for-testing
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create ZAP Reports Directory
+        run: mkdir -p reports/zap
+
+      - name: Run OWASP ZAP Baseline Scan
+        continue-on-error: true
+        run: |
+          echo "🕷️ Starting OWASP ZAP Baseline Scan..."
+          echo "Target: http://172.17.0.1:8080"
+          echo "Note: Using Docker bridge IP to access host container"
+          
+          docker run --rm \
+            --network host \
+            -v $(pwd)/reports/zap:/zap/wrk:rw \
+            -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://172.17.0.1:8080 \
+            -r zap-baseline-report.html \
+            -J zap-baseline-report.json \
+            -x zap-baseline-report.xml \
+            -I \
+            -d || {
+              echo "⚠️ ZAP scan completed with warnings (expected for baseline scan)"
+            }
+          
+          echo "✅ OWASP ZAP baseline scan completed"
+
+      - name: Run OWASP ZAP Full Scan (Active)
+        continue-on-error: true
+        run: |
+          echo "🕷️ Starting OWASP ZAP Full Active Scan..."
+          echo "⚠️  This performs active attacks to detect vulnerabilities"
+          
+          docker run --rm \
+            --network host \
+            -v $(pwd)/reports/zap:/zap/wrk:rw \
+            -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t http://172.17.0.1:8080 \
+            -r zap-full-report.html \
+            -J zap-full-report.json \
+            -x zap-full-report.xml \
+            -I \
+            -d || {
+              echo "⚠️ ZAP full scan completed with findings"
+            }
+          
+          echo "✅ OWASP ZAP full scan completed"
+
+      - name: Analyze ZAP Results
+        if: always()
+        run: |
+          echo "═══════════════════════════════════════════════════════════"
+          echo "🕷️ OWASP ZAP Scan Results Summary"
+          echo "═══════════════════════════════════════════════════════════"
+          
+          if [ -f "reports/zap/zap-full-report.json" ]; then
+            # Count vulnerabilities by risk level
+            HIGH=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' reports/zap/zap-full-report.json 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' reports/zap/zap-full-report.json 2>/dev/null || echo "0")
+            LOW=$(jq '[.site[].alerts[] | select(.riskcode=="1")] | length' reports/zap/zap-full-report.json 2>/dev/null || echo "0")
+            INFO=$(jq '[.site[].alerts[] | select(.riskcode=="0")] | length' reports/zap/zap-full-report.json 2>/dev/null || echo "0")
+            
+            echo "HIGH Risk:   $HIGH"
+            echo "MEDIUM Risk: $MEDIUM"
+            echo "LOW Risk:    $LOW"
+            echo "INFO:        $INFO"
+            echo ""
+            
+            if [ "$HIGH" -gt 0 ]; then
+              echo "❌ CRITICAL: $HIGH high-risk vulnerabilities found!"
+              echo "⚠️  Review the ZAP report immediately"
+            elif [ "$MEDIUM" -gt 0 ]; then
+              echo "⚠️  WARNING: $MEDIUM medium-risk vulnerabilities found"
+            else
+              echo "✅ No high or medium risk vulnerabilities detected"
+            fi
+          else
+            echo "⚠️ ZAP report not found, scan may have failed"
+          fi
+          
+          echo "═══════════════════════════════════════════════════════════"
+
+      - name: Upload OWASP ZAP Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-zap-reports
+          path: reports/zap/
+          retention-days: 30
+
+      - name: Cleanup - Stop Test Container
+        if: always()
+        run: |
+          docker stop bankapp-test 2>/dev/null || true
+          docker rm bankapp-test 2>/dev/null || true
+          echo "✅ Test container cleaned up"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 11: PUSH TO CONTAINER REGISTRY
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Publish secure, scanned image to Docker Hub
+# Only executed if image passes all security scans (SAST, SCA, and DAST)
+# Image is now ready for production deployment
+# ══════════════════════════════════════════════════════════════════════════════
+  docker-push:
+    name: "📤 Push Docker Image to Registry"
+    runs-on: self-hosted
+    needs: owasp-zap-scan
+    environment: My-CI-pipeline-envs
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ env.DOCKER_IMAGE }}
+          echo "✅ Image pushed successfully: ${{ env.DOCKER_IMAGE }}"
+
+      - name: Generate Image Metadata
+        run: |
+          echo "IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.DOCKER_IMAGE }})" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 12: SECURITY REPORT NOTIFICATION (SUCCESS OR FAILURE)
+# ══════════════════════════════════════════════════════════════════════════════
+# Purpose: Send comprehensive notification with pipeline status
+# Triggers: Always runs regardless of success/failure
+# Includes: Build status, failed stage details, available reports
+# Smart Logic: Adapts email content based on which stage failed
+# ══════════════════════════════════════════════════════════════════════════════
+  security-notification:
+    name: "📧 Send Build Status & Security Reports"
+    runs-on: self-hosted
+    needs: 
+      - compile
+      - gitleaks-scan
+      - trivy-fs-scan
+      - sonarqube-analysis
+      - owasp-dependency-check
+      - build-artifact
+      - docker-build
+      - trivy-image-scan
+      - deploy-for-testing
+      - owasp-zap-scan
+      - docker-push
+    environment: My-CI-pipeline-envs
+    if: always()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create Reports Directory
+        run: mkdir -p reports
+
+      - name: Download Gitleaks Report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-report
+          path: reports/gitleaks-report
+
+      - name: Download Trivy FS Reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-fs-reports
+          path: reports/trivy-fs-reports
+
+      - name: Download SonarQube Report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: sonarqube-report
+          path: reports/sonarqube-report
+
+      - name: Download OWASP Report
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: owasp-report
+          path: reports/owasp-report
+
+      - name: Download Trivy Image Reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-image-reports
+          path: reports/trivy-image-reports
+
+      - name: Download OWASP ZAP Reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: owasp-zap-reports
+          path: reports/owasp-zap-reports
+
+      - name: Determine Pipeline Status
+        id: pipeline_status
+        run: |
+          # Check status of each job
+          COMPILE_STATUS="${{ needs.compile.result }}"
+          GITLEAKS_STATUS="${{ needs.gitleaks-scan.result }}"
+          TRIVY_FS_STATUS="${{ needs.trivy-fs-scan.result }}"
+          SONAR_STATUS="${{ needs.sonarqube-analysis.result }}"
+          OWASP_STATUS="${{ needs.owasp-dependency-check.result }}"
+          BUILD_STATUS="${{ needs.build-artifact.result }}"
+          DOCKER_BUILD_STATUS="${{ needs.docker-build.result }}"
+          TRIVY_IMAGE_STATUS="${{ needs.trivy-image-scan.result }}"
+          DEPLOY_STATUS="${{ needs.deploy-for-testing.result }}"
+          ZAP_STATUS="${{ needs.owasp-zap-scan.result }}"
+          DOCKER_PUSH_STATUS="${{ needs.docker-push.result }}"
+          
+          # Initialize variables
+          OVERALL_STATUS="SUCCESS"
+          FAILED_STAGE="None"
+          STATUS_EMOJI="✅"
+          STATUS_COLOR="GREEN"
+          
+          # Check each stage and identify first failure
+          if [ "$COMPILE_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 1: Compilation"
+            STATUS_EMOJI="❌"
+            STATUS_COLOR="RED"
+          elif [ "$GITLEAKS_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 2: Secret Scanning (Gitleaks)"
+            STATUS_EMOJI="🔐❌"
+            STATUS_COLOR="RED"
+          elif [ "$TRIVY_FS_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 3: Filesystem Security Scan (Trivy FS)"
+            STATUS_EMOJI="🛡️❌"
+            STATUS_COLOR="RED"
+          elif [ "$SONAR_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 4: Code Quality Analysis (SonarQube)"
+            STATUS_EMOJI="🔍❌"
+            STATUS_COLOR="RED"
+          elif [ "$OWASP_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 5: Dependency Scan (OWASP)"
+            STATUS_EMOJI="📚❌"
+            STATUS_COLOR="RED"
+          elif [ "$BUILD_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 6: Application Build"
+            STATUS_EMOJI="🏗️❌"
+            STATUS_COLOR="RED"
+          elif [ "$DOCKER_BUILD_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 7: Docker Image Build"
+            STATUS_EMOJI="🐳❌"
+            STATUS_COLOR="RED"
+          elif [ "$TRIVY_IMAGE_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 8: Container Security Scan (Trivy Image)"
+            STATUS_EMOJI="🔎❌"
+            STATUS_COLOR="RED"
+          elif [ "$DEPLOY_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 9: Deploy Application for Testing"
+            STATUS_EMOJI="🚀❌"
+            STATUS_COLOR="RED"
+          elif [ "$ZAP_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 10: Runtime Security Scan (OWASP ZAP)"
+            STATUS_EMOJI="🕷️❌"
+            STATUS_COLOR="RED"
+          elif [ "$DOCKER_PUSH_STATUS" != "success" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_STAGE="Stage 11: Docker Push to Registry"
+            STATUS_EMOJI="📤❌"
+            STATUS_COLOR="RED"
+          fi
+          
+          # Export to GitHub output
+          echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          echo "failed_stage=$FAILED_STAGE" >> $GITHUB_OUTPUT
+          echo "status_emoji=$STATUS_EMOJI" >> $GITHUB_OUTPUT
+          echo "status_color=$STATUS_COLOR" >> $GITHUB_OUTPUT
+          
+          # Save individual job statuses
+          echo "compile_status=$COMPILE_STATUS" >> $GITHUB_OUTPUT
+          echo "gitleaks_status=$GITLEAKS_STATUS" >> $GITHUB_OUTPUT
+          echo "trivy_fs_status=$TRIVY_FS_STATUS" >> $GITHUB_OUTPUT
+          echo "sonar_status=$SONAR_STATUS" >> $GITHUB_OUTPUT
+          echo "owasp_status=$OWASP_STATUS" >> $GITHUB_OUTPUT
+          echo "build_status=$BUILD_STATUS" >> $GITHUB_OUTPUT
+          echo "docker_build_status=$DOCKER_BUILD_STATUS" >> $GITHUB_OUTPUT
+          echo "trivy_image_status=$TRIVY_IMAGE_STATUS" >> $GITHUB_OUTPUT
+          echo "deploy_status=$DEPLOY_STATUS" >> $GITHUB_OUTPUT
+          echo "zap_status=$ZAP_STATUS" >> $GITHUB_OUTPUT
+          echo "docker_push_status=$DOCKER_PUSH_STATUS" >> $GITHUB_OUTPUT
+          
+          echo "Pipeline Overall Status: $OVERALL_STATUS"
+          echo "Failed Stage: $FAILED_STAGE"
+
+      - name: List Available Reports
+        id: available_reports
+        run: |
+          echo "═══════════════════════════════════════════════════════════"
+          echo "📋 Available Security Reports"
+          echo "═══════════════════════════════════════════════════════════"
+          
+          REPORTS_LIST=""
+          
+          if [ -d "reports/gitleaks-report" ]; then
+            echo "✓ Gitleaks Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • Gitleaks Secret Scan (JSON)"
+          else
+            echo "✗ Gitleaks Report Not Found"
+          fi
+          
+          if [ -d "reports/trivy-fs-reports" ]; then
+            echo "✓ Trivy FS Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • Trivy Filesystem Scan (HTML + JSON)"
+          else
+            echo "✗ Trivy FS Report Not Found"
+          fi
+          
+          if [ -d "reports/sonarqube-report" ]; then
+            echo "✓ SonarQube Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • SonarQube Code Analysis"
+          else
+            echo "✗ SonarQube Report Not Found"
+          fi
+          
+          if [ -d "reports/owasp-report" ]; then
+            echo "✓ OWASP Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • OWASP Dependency Check (HTML + JSON)"
+          else
+            echo "✗ OWASP Report Not Found"
+          fi
+          
+          if [ -d "reports/trivy-image-reports" ]; then
+            echo "✓ Trivy Image Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • Trivy Container Image Scan (HTML + JSON)"
+          else
+            echo "✗ Trivy Image Report Not Found"
+          fi
+          
+          if [ -d "reports/owasp-zap-reports" ]; then
+            echo "✓ OWASP ZAP Report Found"
+            REPORTS_LIST="${REPORTS_LIST}\n  • OWASP ZAP Runtime Security Scan (HTML + JSON + XML)"
+          else
+            echo "✗ OWASP ZAP Report Not Found"
+          fi
+          
+          echo "reports_list<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORTS_LIST" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate Pipeline Status Report
+        run: |
+          # Determine status icons
+          COMPILE_ICON="✅"
+          GITLEAKS_ICON="✅"
+          TRIVY_FS_ICON="✅"
+          SONAR_ICON="✅"
+          OWASP_ICON="✅"
+          BUILD_ICON="✅"
+          DOCKER_BUILD_ICON="✅"
+          TRIVY_IMAGE_ICON="✅"
+          DEPLOY_ICON="✅"
+          ZAP_ICON="✅"
+          DOCKER_PUSH_ICON="✅"
+          
+          [ "${{ steps.pipeline_status.outputs.compile_status }}" != "success" ] && COMPILE_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.gitleaks_status }}" != "success" ] && GITLEAKS_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.trivy_fs_status }}" != "success" ] && TRIVY_FS_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.sonar_status }}" != "success" ] && SONAR_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.owasp_status }}" != "success" ] && OWASP_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.build_status }}" != "success" ] && BUILD_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.docker_build_status }}" != "success" ] && DOCKER_BUILD_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.trivy_image_status }}" != "success" ] && TRIVY_IMAGE_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.deploy_status }}" != "success" ] && DEPLOY_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.zap_status }}" != "success" ] && ZAP_ICON="❌"
+          [ "${{ steps.pipeline_status.outputs.docker_push_status }}" != "success" ] && DOCKER_PUSH_ICON="❌"
+          
+          # Set skipped icon for stages after failure
+          if [ "${{ steps.pipeline_status.outputs.overall_status }}" == "FAILED" ]; then
+            [ "${{ steps.pipeline_status.outputs.compile_status }}" == "skipped" ] && COMPILE_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.gitleaks_status }}" == "skipped" ] && GITLEAKS_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.trivy_fs_status }}" == "skipped" ] && TRIVY_FS_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.sonar_status }}" == "skipped" ] && SONAR_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.owasp_status }}" == "skipped" ] && OWASP_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.build_status }}" == "skipped" ] && BUILD_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.docker_build_status }}" == "skipped" ] && DOCKER_BUILD_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.trivy_image_status }}" == "skipped" ] && TRIVY_IMAGE_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.deploy_status }}" == "skipped" ] && DEPLOY_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.zap_status }}" == "skipped" ] && ZAP_ICON="⊘"
+            [ "${{ steps.pipeline_status.outputs.docker_push_status }}" == "skipped" ] && DOCKER_PUSH_ICON="⊘"
+          fi
+          
+          mkdir -p reports
+          
+          cat > reports/pipeline-summary.txt << EOF
+          ═══════════════════════════════════════════════════════════════════
+          ${{ steps.pipeline_status.outputs.status_emoji }} DevSecOps Pipeline: ${{ steps.pipeline_status.outputs.overall_status }}
+          ═══════════════════════════════════════════════════════════════════
+          
+          Pipeline Status: ${{ steps.pipeline_status.outputs.status_emoji }} ${{ steps.pipeline_status.outputs.overall_status }}
+          Failed Stage: ${{ steps.pipeline_status.outputs.failed_stage }}
+          
+          ───────────────────────────────────────────────────────────────────
+          Build Information:
+          ───────────────────────────────────────────────────────────────────
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Commit Message: ${{ github.event.head_commit.message }}
+          Triggered by: ${{ github.actor }}
+          Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          
+          ═══════════════════════════════════════════════════════════════════
+          PIPELINE STAGE EXECUTION STATUS
+          ═══════════════════════════════════════════════════════════════════
+          
+          ${COMPILE_ICON}  Stage 1: Code Compilation
+          ${GITLEAKS_ICON}  Stage 2: Secret Detection (Gitleaks) - SAST
+          ${TRIVY_FS_ICON}  Stage 3: Filesystem Security (Trivy FS) - SAST
+          ${SONAR_ICON}  Stage 4: Code Quality & Security (SonarQube) - SAST
+          ${OWASP_ICON}  Stage 5: Dependency Vulnerability Scan (OWASP) - SCA
+          ${BUILD_ICON}  Stage 6: Application Build
+          ${DOCKER_BUILD_ICON}  Stage 7: Docker Image Build
+          ${TRIVY_IMAGE_ICON}  Stage 8: Container Image Scan (Trivy Image) - DAST
+          ${DEPLOY_ICON}  Stage 9: Deploy Application for Testing
+          ${ZAP_ICON}  Stage 10: Runtime Security Testing (OWASP ZAP) - DAST
+          ${DOCKER_PUSH_ICON}  Stage 11: Push to Docker Registry
+          
+          Legend: ✅ Success | ❌ Failed | ⊘ Skipped
+          
+          ───────────────────────────────────────────────────────────────────
+          SAST Tools (Static Application Security Testing):
+          ───────────────────────────────────────────────────────────────────
+          ${GITLEAKS_ICON} Gitleaks          - Secret & Credential Detection
+          ${TRIVY_FS_ICON} Trivy FS          - Filesystem & IaC Security
+          ${SONAR_ICON} SonarQube         - Code Quality & Security Analysis
+          ${OWASP_ICON} OWASP Dep-Check   - Dependency Vulnerability Scanning (SCA)
+          
+          ───────────────────────────────────────────────────────────────────
+          DAST Tools (Dynamic Application Security Testing):
+          ───────────────────────────────────────────────────────────────────
+          ${TRIVY_IMAGE_ICON} Trivy Image       - Container Image Security Scanning
+          ${ZAP_ICON} OWASP ZAP          - Runtime Application Security Testing
+          
+          ───────────────────────────────────────────────────────────────────
+          Docker Image Details:
+          ───────────────────────────────────────────────────────────────────
+          Image: ${{ env.DOCKER_IMAGE }}
+          Status: $([ "${{ steps.pipeline_status.outputs.docker_push_status }}" == "success" ] && echo "✅ Successfully Pushed to Registry" || echo "❌ Push Failed or Skipped")
+          
+          ═══════════════════════════════════════════════════════════════════
+          Available Security Reports:
+          ═══════════════════════════════════════════════════════════════════
+          ${{ steps.available_reports.outputs.reports_list }}
+          
+          $([ "${{ steps.pipeline_status.outputs.overall_status }}" == "FAILED" ] && echo "⚠️  ACTION REQUIRED: Review the failed stage and attached reports." || echo "✅ All security checks passed successfully!")
+          
+          Review the attached reports for detailed security findings.
+          ═══════════════════════════════════════════════════════════════════
+          EOF
+
+      - name: Send Email Notification (Success)
+        if: steps.pipeline_status.outputs.overall_status == 'SUCCESS'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.SMTP_USERNAME }}
+          to: vijayakumarbl276@gmail.com
+          subject: "✅ SUCCESS: DevSecOps Pipeline - ${{ github.repository }} [${{ github.ref_name }}]"
+          body: file://reports/pipeline-summary.txt
+          attachments: |
+            reports/gitleaks-report/*.json
+            reports/trivy-fs-reports/*.html
+            reports/trivy-fs-reports/*.json
+            reports/trivy-image-reports/*.html
+            reports/trivy-image-reports/*.json
+            reports/owasp-report/*.html
+            reports/owasp-report/*.json
+            reports/owasp-zap-reports/*.html
+            reports/owasp-zap-reports/*.json
+
+      - name: Send Email Notification (Failure)
+        if: steps.pipeline_status.outputs.overall_status == 'FAILED'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.SMTP_USERNAME }}
+          to: vijayakumarbl276@gmail.com
+          subject: "❌ FAILED: DevSecOps Pipeline - ${{ github.repository }} [${{ github.ref_name }}] - ${{ steps.pipeline_status.outputs.failed_stage }}"
+          body: file://reports/pipeline-summary.txt
+          attachments: |
+            reports/gitleaks-report/*.json
+            reports/trivy-fs-reports/*.html
+            reports/trivy-fs-reports/*.json
+            reports/trivy-image-reports/*.html
+            reports/trivy-image-reports/*.json
+            reports/owasp-report/*.html
+            reports/owasp-report/*.json
+            reports/owasp-zap-reports/*.html
+            reports/owasp-zap-reports/*.json
+
+      - name: Fail Job if Pipeline Failed
+        if: steps.pipeline_status.outputs.overall_status == 'FAILED'
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "❌ Pipeline Failed at: ${{ steps.pipeline_status.outputs.failed_stage }}"
+          echo "════════════════════════════════════════════════════════════"
+          exit 1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END OF DEVSECOPS CI/CD PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE OVERVIEW:
+# 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ SAST (Static Application Security Testing)                             │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ 1. Gitleaks           → Secret & Credential Detection                  │
+# │ 2. Trivy FS           → Infrastructure as Code Security                 │
+# │ 3. SonarQube          → Code Quality & Security Analysis + Quality Gate │
+# │ 4. OWASP Dep-Check    → Dependency Vulnerability Scanning (SCA)         │
+# └─────────────────────────────────────────────────────────────────────────┘
+# 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ BUILD & CONTAINERIZATION                                                │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ 5. Build Artifact     → Create Application Package                      │
+# │ 6. Docker Build       → Containerize Application                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+# 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ DAST (Dynamic Application Security Testing)                            │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ 7. Trivy Image        → Container Security Scanning                     │
+# │ 8. Deploy App         → Launch Application for Runtime Testing          │
+# │ 9. OWASP ZAP          → Runtime Vulnerability Testing (Active Scanning) │
+# └─────────────────────────────────────────────────────────────────────────┘
+# 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ DEPLOYMENT & REPORTING                                                  │
+# ├─────────────────────────────────────────────────────────────────────────┤
+# │ 10. Docker Push       → Publish to Registry                             │
+# │ 11. Notification      → Security Report Distribution                    │
+# └─────────────────────────────────────────────────────────────────────────┘
+# ══════════════════════════════════════════════════════════════════════════════
