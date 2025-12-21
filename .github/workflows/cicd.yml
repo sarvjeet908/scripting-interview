@@ -24,10 +24,9 @@ jobs:
     name: "📦 Compile Source Code"
     runs-on: self-hosted
     steps:
-      - name: Clean workspace
+      - name: Clean build artifacts
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-          sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+           rm -rf target || true
 
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -714,18 +713,17 @@ jobs:
         id: pipeline_status
         run: |
           # Check status of each job
-           COMPILE_STATUS="${{ needs.compile.result }}"
-           GITLEAKS_STATUS="${{ needs['gitleaks-scan'].result }}"
-           TRIVY_FS_STATUS="${{ needs['trivy-fs-scan'].result }}"
-           SONAR_STATUS="${{ needs['sonarqube-analysis'].result }}"
-           OWASP_STATUS="${{ needs['owasp-dependency-check'].result }}"
-           BUILD_STATUS="${{ needs['build-artifact'].result }}"
-           DOCKER_BUILD_STATUS="${{ needs['docker-build'].result }}"
-           TRIVY_IMAGE_STATUS="${{ needs['trivy-image-scan'].result }}"
-           DEPLOY_STATUS="${{ needs['deploy-for-testing'].result }}"
-           ZAP_STATUS="${{ needs['owasp-zap-scan'].result }}"
-           DOCKER_PUSH_STATUS="${{ needs['docker-push'].result }}"
-
+          COMPILE_STATUS="${{ needs.compile.result }}"
+          GITLEAKS_STATUS="${{ needs.gitleaks-scan.result }}"
+          TRIVY_FS_STATUS="${{ needs.trivy-fs-scan.result }}"
+          SONAR_STATUS="${{ needs.sonarqube-analysis.result }}"
+          OWASP_STATUS="${{ needs.owasp-dependency-check.result }}"
+          BUILD_STATUS="${{ needs.build-artifact.result }}"
+          DOCKER_BUILD_STATUS="${{ needs.docker-build.result }}"
+          TRIVY_IMAGE_STATUS="${{ needs.trivy-image-scan.result }}"
+          DEPLOY_STATUS="${{ needs.deploy-for-testing.result }}"
+          ZAP_STATUS="${{ needs.owasp-zap-scan.result }}"
+          DOCKER_PUSH_STATUS="${{ needs.docker-push.result }}"
           
           # Initialize variables
           OVERALL_STATUS="SUCCESS"
