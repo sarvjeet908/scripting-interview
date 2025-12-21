@@ -11,7 +11,7 @@ permissions:
   security-events: write
 
 env:
-  DOCKER_IMAGE: acecloudacademy/bankapp:latest
+  DOCKER_IMAGE: sarvjeet908/bankapp:latest
 
 jobs:
 # ══════════════════════════════════════════════════════════════════════════════
